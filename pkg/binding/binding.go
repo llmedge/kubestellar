@@ -25,15 +25,18 @@ import (
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/runtime/schema"
+	"k8s.io/klog/v2"
 
 	"github.com/kubestellar/kubestellar/api/control/v1alpha1"
 	"github.com/kubestellar/kubestellar/pkg/util"
 )
 
 // syncBinding syncs a binding object with what is resolved by the bindingpolicy resolver.
-func (c *Controller) syncBinding(ctx context.Context, key util.Key) error {
+func (c *Controller) syncBinding(ctx context.Context, objIdentifier util.ObjectIdentifier) error {
+	logger := klog.FromContext(ctx)
+
 	var unstructuredObj *unstructured.Unstructured
-	if !c.bindingPolicyResolver.ResolutionExists(key.NamespacedName.Name) {
+	if !c.bindingPolicyResolver.ResolutionExists(objIdentifier.ObjectName.Name) {
 		// if a resolution is not associated to the binding's name
 		// then the bindingpolicy has been deleted, and the binding
 		// will eventually be garbage collected. We can safely ignore this.
@@ -41,14 +44,14 @@ func (c *Controller) syncBinding(ctx context.Context, key util.Key) error {
 		return nil
 	}
 
-	obj, err := c.getObjectFromKey(key)
+	obj, err := c.getObjectFromIdentifier(objIdentifier)
 	if errors.IsNotFound(err) {
-		unstructuredObj = util.EmptyUnstructuredObjectFromKey(key)
+		// a resolution exists and the object is not found, therefore it is deleted and should be created
+		unstructuredObj = util.EmptyUnstructuredObjectFromIdentifier(objIdentifier)
 	} else if err != nil {
-		return fmt.Errorf("failed to get runtime.Object from key with gvk (%v) and namespaced-name (%v): %w",
-			key.GVK, key.NamespacedName, err)
+		return fmt.Errorf("failed to get runtime.Object from object identifier (%v): %w", objIdentifier, err)
 	} else {
-		// perform the type assertion only if getObjectFromKey did not fail
+		// perform the type assertion only if getObjectFromIdentifier did not fail
 		var ok bool
 		unstructuredObj, ok = obj.(*unstructured.Unstructured)
 		if !ok {
@@ -65,9 +68,9 @@ func (c *Controller) syncBinding(ctx context.Context, key util.Key) error {
 	bindingPolicyIdentifier := binding.GetName()
 
 	// generate binding spec from resolver
-	generatedBindingSpec, err := c.bindingPolicyResolver.GenerateBinding(bindingPolicyIdentifier)
-	if err != nil {
-		return fmt.Errorf("failed to generate BindingSpec: %w", err)
+	generatedBindingSpec := c.bindingPolicyResolver.GenerateBinding(bindingPolicyIdentifier)
+	if generatedBindingSpec == nil { // resolution does not exist, abort syncing
+		return fmt.Errorf("syncing Binding was stopped because it has no counterpart resolution")
 	}
 
 	// calculate if the resolved decision is different from the current one
@@ -80,7 +83,7 @@ func (c *Controller) syncBinding(ctx context.Context, key util.Key) error {
 		return nil
 	}
 
-	c.logger.Info("binding is up to date", "name", binding.GetName())
+	logger.Info("binding is up to date", "name", binding.GetName())
 	return nil
 }
 
@@ -104,6 +107,8 @@ func (c *Controller) updateOrCreateBinding(ctx context.Context, bdg *v1alpha1.Bi
 		return fmt.Errorf("failed to convert Binding to Unstructured: %w", err)
 	}
 
+	logger := klog.FromContext(ctx)
+
 	_, err = c.dynamicClient.Resource(schema.GroupVersionResource{
 		Group:    v1alpha1.SchemeGroupVersion.Group,
 		Version:  bdg.GetObjectKind().GroupVersionKind().Version,
@@ -120,14 +125,14 @@ func (c *Controller) updateOrCreateBinding(ctx context.Context, bdg *v1alpha1.Bi
 				return fmt.Errorf("failed to create binding: %w", err)
 			}
 
-			c.logger.Info("created binding", "name", bdg.GetName())
+			logger.Info("created binding", "name", bdg.GetName())
 			return nil
 		} else {
 			return fmt.Errorf("failed to update binding: %w", err)
 		}
 	}
 
-	c.logger.Info("updated binding", "name", bdg.GetName())
+	logger.Info("updated binding", "name", bdg.GetName())
 	return nil
 }
 

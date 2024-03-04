@@ -19,11 +19,8 @@ package binding
 import (
 	"context"
 	"fmt"
-	"strings"
-	"time"
 
 	"github.com/go-logr/logr"
-	workv1 "open-cluster-management.io/api/work/v1"
 
 	corev1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/api/errors"
@@ -33,8 +30,9 @@ import (
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/runtime/schema"
 	utilruntime "k8s.io/apimachinery/pkg/util/runtime"
+	"k8s.io/apimachinery/pkg/util/sets"
 	"k8s.io/client-go/dynamic"
-	"sigs.k8s.io/controller-runtime/pkg/client"
+	"k8s.io/klog/v2"
 	"sigs.k8s.io/controller-runtime/pkg/controller/controllerutil"
 
 	"github.com/kubestellar/kubestellar/api/control/v1alpha1"
@@ -43,28 +41,31 @@ import (
 )
 
 const (
-	waitBeforeTrackingBindingPolicies = 5 * time.Second
-	KSFinalizer                       = "bindingpolicy.kubestellar.io/kscontroller"
+	KSFinalizer = "bindingpolicy.kubestellar.io/kscontroller"
 )
 
 // Handle bindingpolicy as follows:
 //
-//  1. if bindingpolicy is not being deleted:
-//
-//     - update the (where) resolution of the bindingpolicy and queue the
+// if bindingpolicy is not being deleted:
+//   - update the (where) resolution of the bindingpolicy and queue the
 //     associated binding for syncing.
+//   - requeue workload objects to account for changes in bindingpolicy
 //
-//     - requeue workload objects to account for changes in bindingpolicy
-//
-//     otherwise:
-//
-//     - delete the resolution of the bindingpolicy.
-//
-//  2. handle finalizers and deletion of objects associated with the bindingpolicy.
-//
-//  3. for updates on label selectors, re-evaluate if existing objects should be removed
-//     from clusters.
-func (c *Controller) handleBindingPolicy(ctx context.Context, obj runtime.Object) error {
+// otherwise:
+//   - if binding policy wants singleton-status reported, requeue all selected
+//     workload objects to remove the singleton label.
+//   - delete the bindingpolicy's finalizer and remove its resolution.
+func (c *Controller) handleBindingPolicy(ctx context.Context, objIdentifier util.ObjectIdentifier) error {
+	logger := klog.FromContext(ctx)
+
+	obj, err := c.getObjectFromIdentifier(objIdentifier)
+	if errors.IsNotFound(err) {
+		// binding policy is deleted, update resolver.
+		return c.deleteResolutionForBindingPolicy(ctx, objIdentifier.ObjectName.Name)
+	} else if err != nil {
+		return fmt.Errorf("failed to get runtime.Object from object identifier (%v): %w", objIdentifier, err)
+	}
+
 	bindingPolicy, err := runtimeObjectToBindingPolicy(obj)
 	if err != nil {
 		return fmt.Errorf("failed to convert runtime.Object to BindingPolicy: %w", err)
@@ -72,65 +73,88 @@ func (c *Controller) handleBindingPolicy(ctx context.Context, obj runtime.Object
 
 	// handle requeing for changes in bindingpolicy, excluding deletion
 	if !isBeingDeleted(obj) {
+		if err := c.handleBindingPolicyFinalizer(ctx, bindingPolicy); err != nil {
+			return fmt.Errorf("failed to handle finalizer for bindingPolicy %s: %w", bindingPolicy.Name, err)
+		}
+
+		// note bindingpolicy in resolver to create/update its resolution
+		c.bindingPolicyResolver.NoteBindingPolicy(bindingPolicy)
+
 		// update bindingpolicy resolution destinations since bindingpolicy was updated
 		clusterSet, err := ocm.FindClustersBySelectors(c.ocmClient, bindingPolicy.Spec.ClusterSelectors)
 		if err != nil {
 			return fmt.Errorf("failed to ocm.FindClustersBySelectors: %w", err)
 		}
 
-		// note bindingpolicy in resolver in case it isn't associated with
-		// any resolution
-		c.bindingPolicyResolver.NoteBindingPolicy(bindingPolicy)
+		if bindingPolicy.Spec.WantSingletonReportedState {
+			// if the bindingpolicy requires a singleton status, then we should only
+			// have one destination
+			// TODO: this should be removed once we have proper enforcement or error reporting for this
+			clusterSet = pickSingleDestination(clusterSet)
+		}
+
 		// set destinations and enqueue binding for syncing
-		c.bindingPolicyResolver.SetDestinations(bindingPolicy.GetName(), clusterSet)
-		c.logger.V(4).Info("enqueued Binding for syncing, while handling BindingPolicy", "name", bindingPolicy.Name)
+		// we can skip handling the error since the call to BindingPolicyResolver::NoteBindingPolicy above
+		// guarantees that an error won't be returned here
+		_ = c.bindingPolicyResolver.SetDestinations(bindingPolicy.GetName(), clusterSet)
+		logger.V(4).Info("Enqueued Binding for syncing, while handling BindingPolicy", "name", bindingPolicy.Name)
 		c.enqueueBinding(bindingPolicy.GetName())
 
-		// requeue objects for re-evaluation
-		if err := c.requeueForBindingPolicyChanges(); err != nil {
+		// requeue all objects to account for changes in bindingpolicy.
+		// this does not include bindingpolicy/binding objects.
+		return c.requeueWorkloadObjects(ctx, bindingPolicy.Name)
+	}
+
+	// we delete finalizer if the policy is being deleted (not yet deleted).
+	if err = c.handleBindingPolicyFinalizer(ctx, bindingPolicy); err != nil {
+		return fmt.Errorf("failed to handle finalizer for bindingPolicy %s: %w", bindingPolicy.Name, err)
+	}
+
+	return c.deleteResolutionForBindingPolicy(ctx, objIdentifier.ObjectName.Name)
+}
+
+func (c *Controller) deleteResolutionForBindingPolicy(ctx context.Context, bindingPolicyName string) error {
+	if c.bindingPolicyResolver.ResolutionRequiresSingletonReportedState(bindingPolicyName) {
+		// if the bindingpolicy required a singleton status, all selected objects should
+		// be requeued in order to remove the label
+		if err := c.requeueSelectedWorkloadObjects(ctx, bindingPolicyName); err != nil {
 			return fmt.Errorf("failed to c.requeueForBindingPolicyChanges: %w", err)
 		}
-	} else {
-		c.bindingPolicyResolver.DeleteResolution(bindingPolicy.GetName())
 	}
 
-	if err := c.handleBindingPolicyFinalizer(ctx, bindingPolicy); err != nil {
-		return fmt.Errorf("failed to c.handleBindingPolicyFinalizer: %w", err)
-	}
+	logger := klog.FromContext(ctx)
+	c.bindingPolicyResolver.DeleteResolution(bindingPolicyName)
+	logger.Info("Deleted resolution for bindingpolicy", "name", bindingPolicyName)
 
-	err = c.cleanUpObjectsNoLongerMatching(bindingPolicy)
-	if err != nil {
-		return fmt.Errorf("failed to c.cleanUpObjectsNoLongerMatching: %w", err)
-	}
 	return nil
 }
 
-func (c *Controller) requeueForBindingPolicyChanges() error {
-	// allow some time before checking to settle
-	now := time.Now()
-	if now.Sub(c.initializedTs) < waitBeforeTrackingBindingPolicies {
+func (c *Controller) requeueSelectedWorkloadObjects(ctx context.Context, bindingPolicyName string) error {
+	if !c.bindingPolicyResolver.ResolutionExists(bindingPolicyName) {
 		return nil
 	}
 
-	// requeue all objects to account for changes in bindingpolicy.
-	// this does not include bindingpolicy/binding objects.
-	return c.requeueWorkloadObjects()
-}
-
-func (c *Controller) getBindingPolicyByName(name string) (runtime.Object, error) {
-	lister := c.listers["control.kubestellar.io/v1alpha1/BindingPolicy"]
-	if lister == nil {
-		return nil, fmt.Errorf("could not get lister for BindingPolicy")
-	}
-	got, err := lister.Get(name)
+	// requeue all objects that are selected by the bindingpolicy (are in its resolution)
+	objectIdentifiers, err := c.bindingPolicyResolver.GetObjectIdentifiers(bindingPolicyName)
 	if err != nil {
-		return nil, err
+		return fmt.Errorf("failed to get object identifiers from bindingpolicy resolver for "+
+			"bindingpolicy %s: %w", bindingPolicyName, err)
 	}
-	return got, nil
+
+	logger := klog.FromContext(ctx)
+	for objIdentifier := range objectIdentifiers {
+		logger.V(4).Info("Enqueuing workload object due to change in BindingPolicy",
+			"objectIdentifier", objIdentifier, "bindingPolicyName", bindingPolicyName)
+		c.enqueueObjectIdentifier(objIdentifier)
+	}
+
+	return nil
 }
 
-func (c *Controller) evaluateBindingPoliciesForUpdate(ctx context.Context, oldLabels labels.Set, newLabels labels.Set) {
-	c.logger.Info("evaluating BindingPolicies")
+func (c *Controller) evaluateBindingPoliciesForUpdate(ctx context.Context, clusterId string, oldLabels labels.Set, newLabels labels.Set) {
+	logger := klog.FromContext(ctx)
+
+	logger.Info("Evaluating BindingPolicies for cluster", "clusterId", clusterId)
 	bindingPolicies, err := c.listBindingPolicies()
 	if err != nil {
 		utilruntime.HandleError(err)
@@ -153,13 +177,16 @@ func (c *Controller) evaluateBindingPoliciesForUpdate(ctx context.Context, oldLa
 			return
 		}
 		if match1 || match2 {
-			c.enqueueObject(bindingPolicy, true)
+			logger.V(4).Info("Enqueuing workload object due to cluster and BindingPolicy", "clusterId", clusterId, "bindingPolicyName", bindingPolicy.Name)
+			c.enqueueObject(bindingPolicy, util.BindingPolicyResource)
 		}
 	}
 }
 
-func (c *Controller) evaluateBindingPolicies(ctx context.Context, labelsSet labels.Set) {
-	c.logger.Info("evaluating BindingPolicies")
+func (c *Controller) evaluateBindingPolicies(ctx context.Context, clusterId string, labelsSet labels.Set) {
+	logger := klog.FromContext(ctx)
+
+	logger.Info("evaluating BindingPolicies")
 	bindingPolicies, err := c.listBindingPolicies()
 	if err != nil {
 		utilruntime.HandleError(err)
@@ -177,13 +204,14 @@ func (c *Controller) evaluateBindingPolicies(ctx context.Context, labelsSet labe
 			return
 		}
 		if match {
-			c.enqueueObject(bindingPolicy, true)
+			logger.V(4).Info("Enqueuing BindingPolicy due to cluster notification", "clusterId", clusterId, "bindingPolicyName", bindingPolicy.Name)
+			c.enqueueObject(bindingPolicy, util.BindingPolicyResource)
 		}
 	}
 }
 
 func (c *Controller) listBindingPolicies() ([]runtime.Object, error) {
-	lister := c.listers["control.kubestellar.io/v1alpha1/BindingPolicy"]
+	lister := c.listers[util.GetBindingPolicyGVR()]
 	if lister == nil {
 		return nil, fmt.Errorf("could not get lister for BindingPolicy")
 	}
@@ -209,19 +237,24 @@ func runtimeObjectToBindingPolicy(obj runtime.Object) (*v1alpha1.BindingPolicy, 
 // read objects from all workload listers and enqueue
 // the keys this is useful for when a new bindingpolicy is
 // added or a bindingpolicy is updated
-func (c *Controller) requeueWorkloadObjects() error {
+func (c *Controller) requeueWorkloadObjects(ctx context.Context, bindingPolicyName string) error {
+	logger := klog.FromContext(ctx)
 	for key, lister := range c.listers {
 		// do not requeue bindingpolicies or bindings
-		if key == util.GetBindingPolicyListerKey() || key == util.GetBindingListerKey() {
-			fmt.Printf("Matched key %s\n", key)
+		if key == util.GetBindingPolicyGVR() || key == util.GetBindingGVR() {
+			logger.Info("Not enqueuing control object", "key", key)
 			continue
 		}
 		objs, err := lister.List(labels.Everything())
 		if err != nil {
+			logger.Info("Lister failed", "key", key, "err", err)
 			return err
 		}
 		for _, obj := range objs {
-			c.enqueueObject(obj, true)
+			logger.V(4).Info("Enqueuing workload object due to BindingPolicy",
+				"listerKey", key, "obj", util.RefToRuntimeObj(obj),
+				"bindingPolicyName", bindingPolicyName)
+			c.enqueueObject(obj, key.GroupResource().Resource)
 		}
 	}
 	return nil
@@ -231,11 +264,13 @@ func (c *Controller) requeueWorkloadObjects() error {
 func (c *Controller) handleBindingPolicyFinalizer(ctx context.Context, bindingPolicy *v1alpha1.BindingPolicy) error {
 	if bindingPolicy.GetDeletionTimestamp() != nil {
 		if controllerutil.ContainsFinalizer(bindingPolicy, KSFinalizer) {
-			if err := c.deleteExternalResources(bindingPolicy); err != nil {
-				return err
-			}
 			controllerutil.RemoveFinalizer(bindingPolicy, KSFinalizer)
 			if err := updateBindingPolicy(ctx, c.dynamicClient, bindingPolicy); err != nil {
+				if errors.IsNotFound(err) {
+					// object was deleted after getting into this function. This is not an error.
+					return nil
+				}
+
 				return err
 			}
 		}
@@ -267,155 +302,8 @@ func updateBindingPolicy(ctx context.Context, client dynamic.Interface, bindingP
 		Object: innerObj,
 	}
 
-	client.Resource(gvr).Namespace("").Update(ctx, unstructuredObj, metav1.UpdateOptions{})
-	return nil
-}
-
-func (c *Controller) deleteExternalResources(bindingPolicy *v1alpha1.BindingPolicy) error {
-	list, err := listManifestsForBindingPolicy(c.ocmClient, c.wdsName, bindingPolicy)
-	if err != nil {
-		return err
-	}
-
-	labelKey := util.GenerateManagedByBindingPolicyLabelKey(c.wdsName, bindingPolicy.GetName())
-	for _, manifest := range list.Items {
-		c.logger.Info("Trying to delete manifest", "manifest name", manifest.Name,
-			"namespace", manifest.Namespace, "for bindingpolicy", bindingPolicy.GetName())
-		if err := deleteManifestOrLabel(labelKey, manifest, c.ocmClient); err != nil {
-			return err
-		}
-	}
-	return nil
-}
-
-func listManifestsForBindingPolicy(ocmClient client.Client, wdsName string, bindingPolicy *v1alpha1.BindingPolicy) (*workv1.ManifestWorkList, error) {
-	list := &workv1.ManifestWorkList{}
-	labelKey := util.GenerateManagedByBindingPolicyLabelKey(wdsName, bindingPolicy.GetName())
-
-	// TODO - the ocm client used this way is not using cache. Replace with informer/lister based
-	// on dynamic client to make sure to use the cache
-	if err := ocmClient.List(context.TODO(), list, client.InNamespace(""),
-		client.MatchingLabels(map[string]string{labelKey: util.BindingPolicyLabelValueEnabled})); err != nil {
-		return nil, fmt.Errorf("failed to get list of ITS objects with label %q: %w", labelKey, err)
-	}
-	return list, nil
-}
-
-func deleteManifestOrLabel(managedByLabelKey string, manifest workv1.ManifestWork, ocmClient client.Client) error {
-	labels := manifest.GetLabels()
-
-	if isAlsoManagedByOtherBindingPolicies(labels, managedByLabelKey) {
-		delete(labels, managedByLabelKey)
-		if err := ocmClient.Update(context.TODO(), &manifest, &client.UpdateOptions{}); err != nil {
-			return err
-		}
-		return nil
-	}
-
-	// if no other labels can safely delete
-	if err := ocmClient.Delete(context.TODO(), &manifest, &client.DeleteOptions{}); err != nil {
-		// can ignore as it could be already deleted by another thread
-		if errors.IsNotFound(err) {
-			return nil
-		}
-		return err
-	}
-	return nil
-}
-
-func isAlsoManagedByOtherBindingPolicies(labels map[string]string, managedByLabelKey string) bool {
-	for key := range labels {
-		if key == managedByLabelKey {
-			// This is the key for the BindingPolicy we know about
-			continue
-		}
-		if key == util.BindingPolicyLabelSingletonStatus {
-			// This is a singleton marker, ignore it...
-			continue
-		}
-		if strings.HasPrefix(key, util.BindingPolicyLabelKeyBase) {
-			// This is a key managed by Kubestellar, but not for the BindingPolicy
-			// we already know about
-			return true
-		}
-	}
-	return false
-}
-
-// Handle removal of objects no longer matching cluster/selector
-func (c *Controller) cleanUpObjectsNoLongerMatching(bindingPolicy *v1alpha1.BindingPolicy) error {
-	// allow some time before checking to settle
-	now := time.Now()
-	if now.Sub(c.initializedTs) < waitBeforeTrackingBindingPolicies {
-		return nil
-	}
-
-	list, err := listManifestsForBindingPolicy(c.ocmClient, c.wdsName, bindingPolicy)
-	if err != nil {
-		return err
-	}
-
-	for _, manifest := range list.Items {
-		obj, err := extractObjectFromManifest(manifest)
-		if err != nil {
-			return err
-		}
-		matches, err := c.checkObjectMatchesWhatAndWhere(bindingPolicy, *obj, manifest)
-		if err != nil {
-			return fmt.Errorf("failed to c.checkObjectMatchesWhatAndWhere on ManifestWork %s/%s: %w", manifest.Namespace, manifest.Name, err)
-		}
-		if !matches {
-			if err := c.ocmClient.Delete(context.TODO(), &manifest, &client.DeleteOptions{}); err != nil {
-				return fmt.Errorf("failed to delete ManifestWork %q in namespace %q: %w", manifest.Name, manifest.Namespace, err)
-			}
-		}
-	}
-
-	return nil
-}
-
-func extractObjectFromManifest(manifest workv1.ManifestWork) (*runtime.Object, error) {
-	nObjs := len(manifest.Spec.Workload.Manifests)
-	if nObjs != 1 {
-		return nil, fmt.Errorf("manifest should contain one object. Found %d", nObjs)
-	}
-
-	raw := manifest.Spec.Workload.Manifests[0].RawExtension
-	obj := &unstructured.Unstructured{}
-	err := obj.UnmarshalJSON(raw.Raw)
-	if err != nil {
-		fmt.Printf("Error while decoding RawExtension: %v", err)
-		return nil, err
-	}
-	rObj := runtime.Object(obj)
-
-	return &rObj, nil
-}
-
-func (c *Controller) checkObjectMatchesWhatAndWhere(bindingPolicy *v1alpha1.BindingPolicy, obj runtime.Object, manifest workv1.ManifestWork) (bool, error) {
-	// default is doing nothing, that is, return match ==true
-	match := true
-
-	// check the What matches
-	objMR := obj.(mrObject)
-	matchedSome := c.testObject(objMR, bindingPolicy.Spec.Downsync)
-	if !matchedSome {
-		c.logger.Info("The 'What' no longer matches. Object marked for removal.", "object", util.RefToRuntimeObj(obj), "for bindingpolicy", bindingPolicy.GetName())
-		return false, nil
-	}
-
-	// check the Where matches
-	clusterName := getClusterNameFromManifest(manifest)
-	matchedClusters, err := ocm.FindClustersBySelectors(c.ocmClient, bindingPolicy.Spec.ClusterSelectors)
-	if err != nil {
-		return match, err
-	}
-	if !matchedClusters.Has(clusterName) {
-		c.logger.Info("The 'Where' no longer matches. Object marked for removal.", "object", util.RefToRuntimeObj(obj), "for bindingpolicy", bindingPolicy.GetName(), "cluster", clusterName)
-		return false, nil
-	}
-
-	return match, nil
+	_, err = client.Resource(gvr).Namespace("").Update(ctx, unstructuredObj, metav1.UpdateOptions{})
+	return err
 }
 
 type mrObject interface {
@@ -423,44 +311,48 @@ type mrObject interface {
 	runtime.Object
 }
 
-func (c *Controller) testObject(obj mrObject, tests []v1alpha1.DownsyncObjectTest) bool {
-	objNSName := obj.GetNamespace()
-	objName := obj.GetName()
-	objLabels := obj.GetLabels()
-	gvk := obj.GetObjectKind().GroupVersionKind()
-
-	objGVR, haveGVR := c.gvkGvrMapper.GetGvr(gvk)
-	if !haveGVR {
-		c.logger.Info("No GVR, assuming object does not match", "gvk", gvk, "objNS", objNSName, "objName", objName)
-		return false
+func (c *Controller) testObject(ctx context.Context, objIdentifier util.ObjectIdentifier, objLabels map[string]string,
+	tests []v1alpha1.DownsyncObjectTest) bool {
+	gvr := schema.GroupVersionResource{
+		Group:    objIdentifier.GVK.Group,
+		Version:  objIdentifier.GVK.Version,
+		Resource: objIdentifier.Resource,
 	}
+
+	logger := klog.FromContext(ctx)
+
 	var objNS *corev1.Namespace
 	for _, test := range tests {
-		if test.APIGroup != nil && (*test.APIGroup) != gvk.Group {
+		if test.APIGroup != nil && (*test.APIGroup) != objIdentifier.GVK.Group {
 			continue
 		}
-		if len(test.Resources) > 0 && !(SliceContains(test.Resources, "*") || SliceContains(test.Resources, objGVR.Resource)) {
+		if len(test.Resources) > 0 && !(SliceContains(test.Resources, "*") ||
+			SliceContains(test.Resources, gvr.Resource)) {
 			continue
 		}
-		if len(test.Namespaces) > 0 && !(SliceContains(test.Namespaces, "*") || SliceContains(test.Namespaces, objNSName)) {
+		if len(test.Namespaces) > 0 && !(SliceContains(test.Namespaces, "*") ||
+			SliceContains(test.Namespaces, objIdentifier.ObjectName.Namespace)) {
 			continue
 		}
-		if len(test.ObjectNames) > 0 && !(SliceContains(test.ObjectNames, "*") || SliceContains(test.ObjectNames, objName)) {
+		if len(test.ObjectNames) > 0 && !(SliceContains(test.ObjectNames, "*") ||
+			SliceContains(test.ObjectNames, objIdentifier.ObjectName.Name)) {
 			continue
 		}
 		if len(test.ObjectSelectors) > 0 && !labelsMatchAny(c.logger, objLabels, test.ObjectSelectors) {
 			continue
 		}
-		if len(test.NamespaceSelectors) > 0 {
+		if len(test.NamespaceSelectors) > 0 && !ALabelSelectorIsEmpty(test.NamespaceSelectors...) {
 			if objNS == nil {
 				var err error
-				objNS, err = c.kubernetesClient.CoreV1().Namespaces().Get(context.TODO(), objNSName, metav1.GetOptions{})
+				objNS, err = c.kubernetesClient.CoreV1().Namespaces().Get(context.TODO(),
+					objIdentifier.ObjectName.Namespace, metav1.GetOptions{})
 				if err != nil {
-					c.logger.Info("Object namespace not found, assuming object does not match", "gvk", gvk, "objNS", objNSName, "objName", objName)
+					logger.Info("Object namespace not found, assuming object does not match",
+						"object identifier", objIdentifier)
 					continue
 				}
 			}
-			if !labelsMatchAny(c.logger, objNS.Labels, test.NamespaceSelectors) {
+			if !labelsMatchAny(logger, objNS.Labels, test.NamespaceSelectors) {
 				continue
 			}
 		}
@@ -483,8 +375,13 @@ func labelsMatchAny(logger logr.Logger, labelSet map[string]string, selectors []
 	return false
 }
 
-func getClusterNameFromManifest(manifest workv1.ManifestWork) string {
-	return manifest.Namespace
+func ALabelSelectorIsEmpty(selectors ...metav1.LabelSelector) bool {
+	for _, sel := range selectors {
+		if len(sel.MatchExpressions) == 0 && len(sel.MatchLabels) == 0 {
+			return true
+		}
+	}
+	return false
 }
 
 func SliceContains[Elt comparable](slice []Elt, seek Elt) bool {
@@ -494,4 +391,9 @@ func SliceContains[Elt comparable](slice []Elt, seek Elt) bool {
 		}
 	}
 	return false
+}
+
+// sort by name and pick first cluster so that the choice is deterministic based on names
+func pickSingleDestination(clusterSet sets.Set[string]) sets.Set[string] {
+	return sets.New(sets.List(clusterSet)[0])
 }

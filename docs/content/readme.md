@@ -12,12 +12,6 @@
 [![Generate and push docs](https://github.com/kubestellar/kubestellar/actions/workflows/docs-gen-and-push.yml/badge.svg?branch={{ config.ks_branch }})](https://github.com/kubestellar/kubestellar/actions/workflows/docs-gen-and-push.yml)&nbsp;&nbsp;&nbsp;
 [![first-timers-only](https://img.shields.io/badge/first--timers--only-friendly-blue.svg?style=flat-square)](https://www.firsttimersonly.com/)&nbsp;&nbsp;&nbsp;
 [![Broken Links Crawler](https://github.com/kubestellar/kubestellar/actions/workflows/broken-links-crawler.yml/badge.svg)](https://github.com/kubestellar/kubestellar/actions/workflows/broken-links-crawler.yml)
-[![QuickStart test](https://github.com/kubestellar/kubestellar/actions/workflows/docs-ecutable-qs.yml/badge.svg?branch={{ config.ks_branch }})](https://github.com/kubestellar/kubestellar/actions/workflows/docs-ecutable-qs.yml)&nbsp;&nbsp;&nbsp;
-[![docs-ecutable - example1](https://github.com/kubestellar/kubestellar/actions/workflows/docs-ecutable-example1.yml/badge.svg?branch={{ config.ks_branch }})](https://github.com/kubestellar/kubestellar/actions/workflows/docs-ecutable-example1.yml)&nbsp;&nbsp;&nbsp;
-[![docs-ecutable - placement-translator](https://github.com/kubestellar/kubestellar/actions/workflows/docs-ecutable-placement.yml/badge.svg?branch={{ config.ks_branch }})](https://github.com/kubestellar/kubestellar/actions/workflows/docs-ecutable-placement.yml)&nbsp;&nbsp;&nbsp;
-[![docs-ecutable - mailbox-controller](https://github.com/kubestellar/kubestellar/actions/workflows/docs-ecutable-mailbox.yml/badge.svg?branch={{ config.ks_branch }})](https://github.com/kubestellar/kubestellar/actions/workflows/docs-ecutable-mailbox.yml)&nbsp;&nbsp;&nbsp;
-[![docs-ecutable - where-resolver](https://github.com/kubestellar/kubestellar/actions/workflows/docs-ecutable-where-resolver.yml/badge.svg?branch={{ config.ks_branch }})](https://github.com/kubestellar/kubestellar/actions/workflows/docs-ecutable-where-resolver.yml)&nbsp;&nbsp;&nbsp;
-[![docs-ecutable - kubestellar-syncer](https://github.com/kubestellar/kubestellar/actions/workflows/docs-ecutable-syncer.yml/badge.svg?branch={{ config.ks_branch }})](https://github.com/kubestellar/kubestellar/actions/workflows/docs-ecutable-syncer.yml)&nbsp;&nbsp;&nbsp;
 <a href="https://kubernetes.slack.com/archives/C058SUSL5AA"> 
     <img alt="Join Slack" src="https://img.shields.io/badge/KubeStellar-Join%20Slack-blue?logo=slack">
   </a>
@@ -40,25 +34,9 @@ __Don't change anything, just add KubeStellar!__
 - __Scale__ with 1:many and many:1 scenarios
 - __Remain compatible__ with cloud-native solutions
 
-## KubeStellar virtual clusters (Spaces) are our secret
-- KubeStellar uses lightweight virtual clusters (Spaces) that run inside the KubeStellar hosting cluster
-- Standard Kubernetes clusters have __2-300__ api-resources, KubeStellar Spaces have only __40__
-- Fewer api-resources mean resources remain inactive (denatured) – they do not expand into other resources like replicasets, pods, etc.
-- Denaturing is the key to accepting native, unbundled Kubernetes resources as input without running them
-- Unbundled resources are the default and preferred output of most cloud-native tools making KubeStellar use and integration easy
+## Use The Source, Luke
 
-## QuickStart
-
-Checkout our [QuickStart Guide]({{ config.docs_url }}/{{ config.ks_branch }}/Getting-Started/user-quickstart-kind/)
-
-
-## Roadmaps for the Project
-
-We have defined and largely completed the
-[PoC2023q1](../Coding%20Milestones/PoC2023q1/outline/).
-The current activity is refining the definition of, and producing, the
-[PoC2023q4](../Coding%20Milestones/PoC2023q4/outline/).
-Goals not addressed in that PoC are to be explored later.
+**NOTE**: This website is still under construction, and not all of the documentation appears on this website. The rest, which is also still under construction, is designed to be viewed directly from the GitHub repository; see the README of [the KubeStellar GitHub repository](http://github.com/kubestellar/kubestellar). To read the documentation for release `X.Y.Z`, view the Git content tagged `vX.Y.Z`.
 
 ## Contributing
 

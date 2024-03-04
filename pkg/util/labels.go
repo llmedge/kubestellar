@@ -22,53 +22,23 @@ import (
 
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/labels"
+	"k8s.io/apimachinery/pkg/runtime/schema"
 
 	"github.com/kubestellar/kubestellar/api/control/v1alpha1"
 )
 
 const (
-	// BindingPolicy key has the form managed-by.kubestellar.io/<wds-name>.<bindingpolicy-name>
-	// this is because key must be unique per wds and we need to identify the wds for
-	// multi-wds environments.
-	BindingPolicyLabelKeyBase         = "managed-by.kubestellar.io"
-	BindingPolicyLabelValueEnabled    = "true"
-	BindingPolicyLabelSingletonStatus = "managed-by.kubestellar.io/singletonstatus"
+	// BindingPolicyLabelSingletonStatusKey is the key for the singleton status reporting
+	// requirement. The value should be the bindingpolicy that is selecting the labeled object.
+	BindingPolicyLabelSingletonStatusKey = "managed-by.kubestellar.io/singletonstatus"
 )
 
-func GetBindingPolicyListerKey() string {
-	return KeyForGroupVersionKind(v1alpha1.GroupVersion.Group,
-		v1alpha1.GroupVersion.Version, BindingPolicyKind)
+func GetBindingPolicyGVR() schema.GroupVersionResource {
+	return v1alpha1.GroupVersion.WithResource(BindingPolicyResource)
 }
 
-func GetBindingListerKey() string {
-	return KeyForGroupVersionKind(v1alpha1.GroupVersion.Group,
-		v1alpha1.GroupVersion.Version, BindingKind)
-}
-
-func SetManagedByBindingPolicyLabels(obj metav1.Object, wdsName string, managedByBindingPolicies []string, singletonStatus bool) {
-	objLabels := obj.GetLabels()
-	if objLabels == nil {
-		objLabels = make(labels.Set)
-	}
-	for _, bindingpolicy := range managedByBindingPolicies {
-		objLabels = mergeManagedByBindingPolicyLabel(objLabels, wdsName, bindingpolicy)
-	}
-	// label manifest requiring simgleton status so that status controller can evaluate
-	if singletonStatus {
-		objLabels[BindingPolicyLabelSingletonStatus] = BindingPolicyLabelValueEnabled
-	}
-	obj.SetLabels(objLabels)
-}
-
-func mergeManagedByBindingPolicyLabel(l labels.Set, wdsName, bindingPolicyName string) labels.Set {
-	plLabel := make(labels.Set)
-	key := GenerateManagedByBindingPolicyLabelKey(wdsName, bindingPolicyName)
-	plLabel[key] = BindingPolicyLabelValueEnabled
-	return labels.Merge(l, plLabel)
-}
-
-func GenerateManagedByBindingPolicyLabelKey(wdsName, bindingPolicyName string) string {
-	return fmt.Sprintf("%s/%s.%s", BindingPolicyLabelKeyBase, wdsName, bindingPolicyName)
+func GetBindingGVR() schema.GroupVersionResource {
+	return v1alpha1.GroupVersion.WithResource(BindingResource)
 }
 
 type Label struct {

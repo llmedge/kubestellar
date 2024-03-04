@@ -28,14 +28,13 @@ import (
 	ocmclientset "open-cluster-management.io/api/client/cluster/clientset/versioned"
 
 	apiextensionsclientset "k8s.io/apiextensions-apiserver/pkg/client/clientset/clientset"
-	"k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
-	"k8s.io/apimachinery/pkg/labels"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/runtime/schema"
 	utilruntime "k8s.io/apimachinery/pkg/util/runtime"
 	"k8s.io/apimachinery/pkg/util/sets"
 	"k8s.io/apimachinery/pkg/util/wait"
+	"k8s.io/client-go/discovery"
 	"k8s.io/client-go/dynamic"
 	"k8s.io/client-go/dynamic/dynamicinformer"
 	"k8s.io/client-go/kubernetes"
@@ -53,14 +52,13 @@ import (
 
 const controllerName = "Binding"
 
-// Resources group versions to exclude for watchers as they should not delivered to other clusters
-var excludedGroupVersions = map[string]bool{
-	"flowcontrol.apiserver.k8s.io/v1beta3": true,
-	"flowcontrol.apiserver.k8s.io/v1beta2": true,
-	"scheduling.k8s.io/v1":                 true,
-	"discovery.k8s.io/v1":                  true,
-	"apiregistration.k8s.io/v1":            true,
-	"coordination.k8s.io/v1":               true,
+// Resource groups to exclude for watchers as they should not be delivered to other clusters
+var excludedGroups = map[string]bool{
+	"flowcontrol.apiserver.k8s.io": true,
+	"scheduling.k8s.io":            true,
+	"discovery.k8s.io":             true,
+	"apiregistration.k8s.io":       true,
+	"coordination.k8s.io":          true,
 }
 
 // Resource names to exclude for watchers as they should not delivered to other clusters
@@ -86,10 +84,9 @@ type Controller struct {
 	kubernetesClient kubernetes.Interface   // used for Namespaces, and Discovery
 
 	extClient             apiextensionsclientset.Interface // used for CRD
-	listers               map[string]cache.GenericLister
-	gvkGvrMapper          util.GvkGvrMapper
-	informers             map[string]cache.SharedIndexInformer
-	stoppers              map[string]chan struct{}
+	listers               map[schema.GroupVersionResource]cache.GenericLister
+	informers             map[schema.GroupVersionResource]cache.SharedIndexInformer
+	stoppers              map[schema.GroupVersionResource]chan struct{}
 	bindingPolicyResolver BindingPolicyResolver
 	workqueue             workqueue.RateLimitingInterface
 	initializedTs         time.Time
@@ -101,17 +98,28 @@ type Controller struct {
 func NewController(parentLogger logr.Logger, wdsRestConfig *rest.Config, imbsRestConfig *rest.Config,
 	wdsName string, allowedGroupsSet sets.Set[string]) (*Controller, error) {
 
-	dynamicClient, err := dynamic.NewForConfig(wdsRestConfig)
-	if err != nil {
-		return nil, err
-	}
-
 	kubernetesClient, err := kubernetes.NewForConfig(wdsRestConfig)
 	if err != nil {
 		return nil, err
 	}
 
 	extClient, err := apiextensionsclientset.NewForConfig(wdsRestConfig)
+	if err != nil {
+		return nil, err
+	}
+
+	nGVRs, err := countGVRsViaAggregatedDiscovery(kubernetesClient)
+	if err != nil {
+		parentLogger.Error(err, "Not able to count GVRs via aggregated discovery") // but we can still continue
+	}
+	// tuning the rate limiter based on the number of GVRs is tested to be working well
+	wdsRestConfig.Burst = computeBurstFromNumGVRs(nGVRs)
+	wdsRestConfig.QPS = computeQPSFromNumGVRs(nGVRs)
+	parentLogger.V(1).Info("Parameters of the client's token bucket rate limiter", "burst", wdsRestConfig.Burst, "qps", wdsRestConfig.QPS)
+
+	// dynamicClient needs higher rate than its default because dynamicClient is repeatedly used by the
+	// reflectors for each of the GVRs, all at the beginning of the controller run
+	dynamicClient, err := dynamic.NewForConfig(wdsRestConfig)
 	if err != nil {
 		return nil, err
 	}
@@ -124,6 +132,50 @@ func NewController(parentLogger logr.Logger, wdsRestConfig *rest.Config, imbsRes
 	ocmClient := *ocm.GetOCMClient(imbsRestConfig)
 
 	return makeController(parentLogger, dynamicClient, kubernetesClient, extClient, ocmClientset, ocmClient, wdsName, allowedGroupsSet)
+}
+
+func countGVRsViaAggregatedDiscovery(countClient kubernetes.Interface) (int, error) {
+	dc := countClient.Discovery().(*discovery.DiscoveryClient)
+	if dc.UseLegacyDiscovery { // by default it should be false already, just double check
+		dc.UseLegacyDiscovery = false
+	}
+	apiResourceLists, err := dc.ServerPreferredResources()
+	if err != nil {
+		return 0, fmt.Errorf("error listing server perferred resources: %w", err)
+	}
+	n := 0
+	for _, list := range apiResourceLists {
+		n += len(list.APIResources)
+	}
+	return n, nil
+}
+
+func computeBurstFromNumGVRs(nGVRs int) int {
+	burst := nGVRs
+	// in case too small, fall back to default
+	if burst < rest.DefaultBurst {
+		return rest.DefaultBurst
+	}
+	// in case too large, look at some value for reference
+	// https://github.com/kubernetes/kubernetes/blob/5d527dcf1265d7fcd0e6c8ec511ce16cc6a40699/staging/src/k8s.io/cli-runtime/pkg/genericclioptions/config_flags.go#L477
+	if burst > 300 {
+		return 300
+	}
+	return burst
+}
+
+func computeQPSFromNumGVRs(nGVRs int) float32 {
+	qps := float32(nGVRs) / 4
+	// in case too small, fall back to default
+	if qps < rest.DefaultQPS {
+		return rest.DefaultQPS
+	}
+	// in case too large, look at some value for reference
+	// https://github.com/kubernetes/kubernetes/pull/105520/files
+	if qps > 50.0 {
+		return 50.0
+	}
+	return qps
 }
 
 func makeController(parentLogger logr.Logger,
@@ -139,8 +191,6 @@ func makeController(parentLogger logr.Logger,
 		&workqueue.BucketRateLimiter{Limiter: rate.NewLimiter(rate.Limit(50), 300)},
 	)
 
-	gvkGvrMapper := util.NewGvkGvrMapper()
-
 	controller := &Controller{
 		wdsName:               wdsName,
 		logger:                parentLogger.WithName(controllerName),
@@ -149,11 +199,10 @@ func makeController(parentLogger logr.Logger,
 		dynamicClient:         dynamicClient,
 		kubernetesClient:      kubernetesClient,
 		extClient:             extClient,
-		listers:               make(map[string]cache.GenericLister),
-		informers:             make(map[string]cache.SharedIndexInformer),
-		stoppers:              make(map[string]chan struct{}),
-		bindingPolicyResolver: NewBindingPolicyResolver(gvkGvrMapper),
-		gvkGvrMapper:          gvkGvrMapper,
+		listers:               make(map[schema.GroupVersionResource]cache.GenericLister),
+		informers:             make(map[schema.GroupVersionResource]cache.SharedIndexInformer),
+		stoppers:              make(map[schema.GroupVersionResource]chan struct{}),
+		bindingPolicyResolver: NewBindingPolicyResolver(),
 		workqueue:             workqueue.NewRateLimitingQueue(ratelimiter),
 		allowedGroupsSet:      allowedGroupsSet,
 	}
@@ -205,53 +254,50 @@ func (c *Controller) run(ctx context.Context, workers int) error {
 	informerFactory := dynamicinformer.NewDynamicSharedInformerFactory(c.dynamicClient, 0*time.Minute)
 
 	// Loop through the api resources and create informers and listers for each of them
-	for _, group := range apiResources {
-		if _, excluded := excludedGroupVersions[group.GroupVersion]; excluded {
-			logger.V(1).Info("Ignoring excluded APIGroup", "groupVersion", group.GroupVersion)
-			continue
-		}
-		gv, err := schema.ParseGroupVersion(group.GroupVersion)
+	for _, list := range apiResources {
+		gv, err := schema.ParseGroupVersion(list.GroupVersion)
 		if err != nil {
-			c.logger.Error(err, "Failed to parse a GroupVersion", "groupVersion", group.GroupVersion)
+			c.logger.Error(err, "Failed to parse a GroupVersion", "groupVersion", list.GroupVersion)
 			continue
 		}
-		logger.V(1).Info("Working on API Group", "groupVersion", group.GroupVersion, "numResources", len(group.APIResources))
-		for _, resource := range group.APIResources {
+		if _, excluded := excludedGroups[gv.Group]; excluded {
+			logger.V(1).Info("Ignoring APIResourceList", "groupVersion", list.GroupVersion)
+			continue
+		}
+		if !util.IsAPIGroupAllowed(gv.Group, c.allowedGroupsSet) {
+			logger.V(1).Info("No need to watch per user input", "groupVersion", list.GroupVersion)
+			continue
+		}
+		logger.V(1).Info("Working on APIResourceList", "groupVersion", list.GroupVersion, "numResources", len(list.APIResources))
+		for _, resource := range list.APIResources {
 			if _, excluded := excludedResourceNames[resource.Name]; excluded {
-				continue
-			}
-			if !util.IsAPIGroupAllowed(gv.Group, c.allowedGroupsSet) {
 				continue
 			}
 			informable := verbsSupportInformers(resource.Verbs)
 			if informable {
-				key := util.KeyForGroupVersionKind(gv.Group, gv.Version, resource.Kind)
-				informer := informerFactory.ForResource(gv.WithResource(resource.Name)).Informer()
-				c.informers[key] = informer
+				gvr := gv.WithResource(resource.Name)
+				informer := informerFactory.ForResource(gvr).Informer()
+				c.informers[gvr] = informer
 
 				// add the event handler functions
 				informer.AddEventHandler(cache.ResourceEventHandlerFuncs{
-					AddFunc: c.handleObject,
+					AddFunc: func(obj interface{}) {
+						// IMPORTANT: the resource loop variable cannot be used in these closures.
+						c.handleObject(obj, gvr.Resource, "add")
+					},
 					UpdateFunc: func(old, new interface{}) {
 						if shouldSkipUpdate(old, new) {
 							return
 						}
-						c.handleObject(new)
+						c.handleObject(new, gvr.Resource, "update")
 					},
 					DeleteFunc: func(obj interface{}) {
-						if shouldSkipDelete(obj) {
-							return
-						}
-						c.handleObject(obj)
+						c.handleObject(obj, gvr.Resource, "delete")
 					},
 				})
 
 				// create and index the lister
-				lister := cache.NewGenericLister(informer.GetIndexer(), schema.GroupResource{Group: resource.Group, Resource: resource.Name})
-				c.listers[key] = lister
-
-				c.gvkGvrMapper.Add(schema.GroupVersionKind{Group: gv.Group, Version: gv.Version, Kind: resource.Kind},
-					schema.GroupVersionResource{Group: gv.Group, Version: gv.Version, Resource: resource.Name})
+				c.listers[gvr] = cache.NewGenericLister(informer.GetIndexer(), gvr.GroupResource())
 
 				// run the informer
 				// we need to be able to stop informers for APIs (CRDs) that are removed
@@ -259,7 +305,7 @@ func (c *Controller) run(ctx context.Context, workers int) error {
 				// instead than informerFactory.Start(ctx.Done())
 				stopper := make(chan struct{})
 				defer close(stopper)
-				c.stoppers[key] = stopper
+				c.stoppers[gvr] = stopper
 				go informer.Run(stopper)
 			}
 		}
@@ -287,7 +333,7 @@ func (c *Controller) run(ctx context.Context, workers int) error {
 
 	c.logger.Info("Starting workers", "count", workers)
 	for i := 0; i < workers; i++ {
-		logger := c.logger.WithName(fmt.Sprintf("%s-worker-%d", controllerName, i))
+		logger := c.logger.WithName(fmt.Sprintf("worker-%d", i))
 		workerCtx := klog.NewContext(ctx, logger)
 		go wait.UntilWithContext(workerCtx, c.runWorker, time.Second)
 	}
@@ -306,20 +352,22 @@ func (c *Controller) createManagedClustersInformer(ctx context.Context) error {
 	informer := informerFactory.Cluster().V1().ManagedClusters().Informer()
 	_, err := informer.AddEventHandler(cache.ResourceEventHandlerFuncs{
 		AddFunc: func(obj interface{}) {
-			labels := obj.(metav1.Object).GetLabels()
-			c.evaluateBindingPolicies(ctx, labels)
+			objM := obj.(metav1.Object)
+			c.evaluateBindingPolicies(ctx, objM.GetName(), objM.GetLabels())
 		},
 		UpdateFunc: func(old, new interface{}) {
+			oldM := old.(metav1.Object)
+			newM := new.(metav1.Object)
 			// Re-evaluateBindingPolicies iff labels have changed.
-			oldLabels := old.(metav1.Object).GetLabels()
-			newLabels := new.(metav1.Object).GetLabels()
+			oldLabels := oldM.GetLabels()
+			newLabels := newM.GetLabels()
 			if !reflect.DeepEqual(oldLabels, newLabels) {
-				c.evaluateBindingPoliciesForUpdate(ctx, oldLabels, newLabels)
+				c.evaluateBindingPoliciesForUpdate(ctx, newM.GetName(), oldLabels, newLabels)
 			}
 		},
 		DeleteFunc: func(obj interface{}) {
-			labels := obj.(metav1.Object).GetLabels()
-			c.evaluateBindingPolicies(ctx, labels)
+			objM := obj.(metav1.Object)
+			c.evaluateBindingPolicies(ctx, objM.GetName(), objM.GetLabels())
 		},
 	})
 	if err != nil {
@@ -347,13 +395,6 @@ func shouldSkipUpdate(old, new interface{}) bool {
 	return false
 }
 
-func shouldSkipDelete(obj interface{}) bool {
-	// since delete for bindingpolicy is handled by the finalizer logic
-	// no need to handle delete for bindingpolicy to minimize events in the
-	// delete manifests
-	return util.IsBindingPolicy(obj)
-}
-
 // We only start informers on resources that support both watch and list
 func verbsSupportInformers(verbs []string) bool {
 	var hasList, hasWatch bool
@@ -369,57 +410,44 @@ func verbsSupportInformers(verbs []string) bool {
 }
 
 // Event handler: enqueues the objects to be processed
-// At this time it is very simple, more complex processing might be required here
-func (c *Controller) handleObject(obj any) {
-	rObj := obj.(runtime.Object)
-	c.logger.V(2).Info("Got object event", "obj", util.RefToRuntimeObj(rObj))
-	c.enqueueObject(obj, false)
+// At this time it is very simple, more complex processing might be required
+// here.
+func (c *Controller) handleObject(obj any, resource string, eventType string) {
+	wasDeletedFinalStateUnknown := false
+	switch typed := obj.(type) {
+	case cache.DeletedFinalStateUnknown:
+		obj = typed.Obj
+		wasDeletedFinalStateUnknown = true
+	}
+	c.logger.Info("Got object event", "eventType", eventType,
+		"wasDeletedFinalStateUnknown", wasDeletedFinalStateUnknown, "obj", util.RefToRuntimeObj(obj.(runtime.Object)),
+		"resource", resource)
+
+	c.enqueueObject(obj, resource)
 }
 
-// enqueueObject converts an object into a key struct which is then put onto the work queue.
-func (c *Controller) enqueueObject(obj interface{}, skipCheckIsDeleted bool) {
-	var key util.Key
-	var err error
-	if key, err = util.KeyForGroupVersionKindNamespaceName(obj); err != nil {
-		utilruntime.HandleError(err)
-		return
-	}
-	if !skipCheckIsDeleted {
-		// we need to check if object was deleted. If deleted we need to enqueue the runtime.Object
-		// so we can still evaluate the label selectors and delete it from the clusters where it
-		// was deployed. This does not break the best practice of only storing the keys so that
-		// the latest version of the object is retrieved, as we know the object was deleted when
-		// we get a copy of the runtime.Object and there is no longer a copy on the API server.
-		_, err = c.getObjectFromKey(key)
-		if err != nil {
-			// The resource no longer exist, which means it has been deleted.
-			if errors.IsNotFound(err) {
-				deletedObj := copyObjectMetaAndType(obj.(runtime.Object))
-				// set deletion timestamp for this object to still be detected as being deleted
-				metaDeletedObj := deletedObj.(metav1.Object)
-				metaDeletedObj.SetDeletionTimestamp(&metav1.Time{Time: time.Now()})
+// enqueueObject converts an object into an ObjectIdentifier struct which is
+// then put onto the work queue.
+func (c *Controller) enqueueObject(obj interface{}, resource string) {
+	objIdentifier := util.IdentifierForObject(obj.(util.MRObject), resource)
+	c.enqueueObjectIdentifier(objIdentifier)
+}
 
-				key.DeletedObject = &deletedObj
-
-				c.workqueue.Add(key)
-			}
-			return
-		}
-	}
-	c.workqueue.Add(key)
+func (c *Controller) enqueueObjectIdentifier(objIdentifier util.ObjectIdentifier) {
+	c.workqueue.Add(objIdentifier)
 }
 
 func (c *Controller) enqueueBinding(name string) {
-	c.workqueue.AddAfter(util.Key{
+	c.workqueue.AddAfter(util.ObjectIdentifier{
 		GVK: schema.GroupVersionKind{
 			Group:   v1alpha1.GroupVersion.Group,
 			Version: v1alpha1.GroupVersion.Version,
 			Kind:    util.BindingKind},
-		NamespacedName: cache.ObjectName{
+		Resource: util.BindingResource,
+		ObjectName: cache.ObjectName{
 			Namespace: metav1.NamespaceNone,
 			Name:      name,
 		},
-		DeletedObject: nil,
 	}, bindingQueueingDelay) // this resource can have bursts of
 	// updates due to being updated by multiple workload-objects getting
 	// processed concurrently at a high rate.
@@ -436,45 +464,49 @@ func (c *Controller) runWorker(ctx context.Context) {
 // processNextWorkItem reads a single work item off the workqueue and
 // attempt to process it by calling the reconcile.
 func (c *Controller) processNextWorkItem(ctx context.Context) bool {
-	obj, shutdown := c.workqueue.Get()
+	logger := klog.FromContext(ctx)
+	item, shutdown := c.workqueue.Get()
 	if shutdown {
+		logger.V(1).Info("Worker is done")
 		return false
 	}
+	logger.V(4).Info("Dequeued", "item", item)
 
 	// We wrap this block in a func so we can defer c.workqueue.Done.
-	err := func(obj interface{}) error {
+	err := func(objIdentifierA any) error {
 		// We call Done here so the workqueue knows we have finished
 		// processing this item. We also must remember to call Forget if we
 		// do not want this work item being re-queued. For example, we do
 		// not call Forget if a transient error occurs, instead the item is
 		// put back on the workqueue and attempted again after a back-off
 		// period.
-		defer c.workqueue.Done(obj)
-		var key util.Key
+		defer c.workqueue.Done(objIdentifierA)
+		var objIdentifier util.ObjectIdentifier
 		var ok bool
-		// We expect util.Key to come off the workqueue. We do this as the delayed
-		// nature of the workqueue means the items in the informer cache may actually be
-		// more up to date that when the item was initially put onto the
-		// workqueue.
-		if key, ok = obj.(util.Key); !ok {
+		// We expect util.ObjectIdentifier to come off the workqueue. We do this as the
+		// delayed nature of the workqueue means the items in the informer
+		// cache may actually be more up to date that when the item was
+		// initially put onto the workqueue.
+		if objIdentifier, ok = objIdentifierA.(util.ObjectIdentifier); !ok {
 			// if the item in the workqueue is invalid, we call
 			// Forget here to avoid process a work item that is invalid.
-			c.workqueue.Forget(obj)
-			utilruntime.HandleError(fmt.Errorf("expected util.Key in workqueue but got %#v", obj))
+			c.workqueue.Forget(objIdentifierA)
+			utilruntime.HandleError(fmt.Errorf("expected util.ObjectIdentifier in workqueue but got %#v",
+				objIdentifierA))
 			return nil
 		}
-		// Run the reconciler, passing it the full key or the metav1 Object
-		if err := c.reconcile(ctx, key); err != nil {
+		// Run the reconciler, passing it the full object identifier
+		if err := c.reconcile(ctx, objIdentifier); err != nil {
 			// Put the item back on the workqueue to handle any transient errors.
-			c.workqueue.AddRateLimited(obj)
-			return fmt.Errorf("error syncing key '%#v': %s, requeuing", obj, err.Error())
+			c.workqueue.AddRateLimited(objIdentifier)
+			return fmt.Errorf("error syncing object (identifier: %#v): %s, requeuing", objIdentifier, err.Error())
 		}
 		// Finally, if no error occurs we Forget this item so it does not
 		// get queued again until another change happens.
-		c.workqueue.Forget(obj)
-		c.logger.V(2).Info("Successfully synced", "object", obj)
+		c.workqueue.Forget(objIdentifier)
+		logger.V(2).Info("Successfully synced", "objectIdentifier", objIdentifier)
 		return nil
-	}(obj)
+	}(item)
 
 	if err != nil {
 		utilruntime.HandleError(err)
@@ -484,97 +516,40 @@ func (c *Controller) processNextWorkItem(ctx context.Context) bool {
 	return true
 }
 
-func (c *Controller) reconcile(ctx context.Context, key util.Key) error {
-	var obj runtime.Object
-	var err error
-	// special handling for binding resource as it is the only
-	// resource that is queued directly as key, without necessarily first
-	// existing as an object.
-	if util.KeyIsForBinding(key) {
-		return c.syncBinding(ctx, key) // this function logs through all its exits
-	}
-
-	if key.DeletedObject == nil {
-		obj, err = c.getObjectFromKey(key)
-		if err != nil {
-			// The resource no longer exist, which means it has been deleted.
-			if errors.IsNotFound(err) {
-				c.logger.Info("object referenced from work queue no longer exists",
-					"object-name", key.NamespacedName, "object-gvk", key.GvkKey())
-				return nil
-			}
-			return err
-		}
-	} else {
-		obj = *key.DeletedObject
-	}
+func (c *Controller) reconcile(ctx context.Context, objIdentifier util.ObjectIdentifier) error {
+	logger := klog.FromContext(ctx)
 
 	// special handling for selected API resources
 	// note that object is *unstructured.Unstructured so we cannot
 	// just use "switch obj.(type)"
-	if util.IsBindingPolicy(obj) {
-		if err := c.handleBindingPolicy(ctx, obj); err != nil {
+	if util.ObjIdentifierIsForBinding(objIdentifier) {
+		return c.syncBinding(ctx, objIdentifier) // this function logs through all its exits
+	} else if util.ObjIdentifierIsForBindingPolicy(objIdentifier) {
+		if err := c.handleBindingPolicy(ctx, objIdentifier); err != nil {
 			return fmt.Errorf("failed to handle bindingpolicy: %w", err) // error logging after this call
 			// will add name.
 		}
 
-		c.logger.Info("handled bindingpolicy", "object", util.RefToRuntimeObj(obj))
+		logger.Info("Handled bindingpolicy", "objectIdentifier", objIdentifier)
 		return nil
-	} else if util.IsCRD(obj) {
-		if err := c.handleCRD(obj); err != nil {
+	} else if util.ObjIdentifierIsForCRD(objIdentifier) {
+		if err := c.handleCRD(ctx, objIdentifier); err != nil {
 			return fmt.Errorf("failed to handle CRD: %w", err) // error logging after this call
 			// will add name.
 		}
-		c.logger.Info("handled CRD", "object", util.RefToRuntimeObj(obj))
+		logger.Info("Handled CRD", "objectIdentifier", objIdentifier)
 	}
 
-	// avoid further processing for keys of objects being deleted that do not have a deleted object
-	if isBeingDeleted(obj) && key.DeletedObject == nil {
-		return nil
-	}
-
-	if err := c.updateDecisions(obj); err != nil {
-		c.logger.Error(err, "failed to update bindingpolicy resolutions for object",
-			"object", util.RefToRuntimeObj(obj))
-		// return nil // not changing existing flow before transport is ready
-	}
-
-	//TODO (maroon): everything below this line should be deleted when transport is ready
-	clusterSet, managedByBindingPolicies, singletonStatus, err := c.matchSelectors(obj)
-	if err != nil {
-		utilruntime.HandleError(fmt.Errorf("error matching selectors: %s", err))
-		return nil
-	}
-
-	// if no clusters
-	if len(clusterSet) == 0 {
-		return nil
-	}
-
-	if singletonStatus {
-		clusterSet = pickSingleCluster(clusterSet)
-	}
-
-	if key.DeletedObject != nil {
-		c.logger.Info("Deleting", "object", util.RefToRuntimeObj(obj),
-			"from clusters", clusterSet)
-		deleteObjectOnManagedClusters(c.logger, c.ocmClient, *key.DeletedObject, clusterSet)
-		return nil
-	}
-
-	c.logger.Info("Delivering", "object", util.RefToRuntimeObj(obj),
-		"to clusters", clusterSet)
-	return c.deliverObjectToManagedClusters(obj, clusterSet, managedByBindingPolicies, singletonStatus)
+	return c.updateResolutions(ctx, objIdentifier)
 }
 
-func (c *Controller) getObjectFromKey(key util.Key) (runtime.Object, error) {
-	lister := c.listers[key.GvkKey()]
+func (c *Controller) getObjectFromIdentifier(objIdentifier util.ObjectIdentifier) (runtime.Object, error) {
+	lister := c.listers[objIdentifier.GVR()]
 	if lister == nil {
-		utilruntime.HandleError(fmt.Errorf("could not get lister for key: %s", key.GvkKey()))
-		return nil, nil
+		return nil, fmt.Errorf("could not get lister for gvr: %s", objIdentifier.GVR())
 	}
 
-	return getObject(lister, key.NamespacedName.Namespace, key.NamespacedName.Name)
+	return getObject(lister, objIdentifier.ObjectName.Namespace, objIdentifier.ObjectName.Name)
 }
 
 func getObject(lister cache.GenericLister, namespace, name string) (runtime.Object, error) {
@@ -584,36 +559,16 @@ func getObject(lister cache.GenericLister, namespace, name string) (runtime.Obje
 	return lister.Get(name)
 }
 
-// create a minimal runtime.Object copy with no spec and status for use
-// with the delete
-func copyObjectMetaAndType(obj runtime.Object) runtime.Object {
-	dest := obj.DeepCopyObject()
-	dest = ocm.ZeroFields(dest)
-	val := reflect.ValueOf(dest).Elem()
-
-	spec := val.FieldByName("Spec")
-	if spec.IsValid() {
-		spec.Set(reflect.Zero(spec.Type()))
-	}
-
-	status := val.FieldByName("Status")
-	if status.IsValid() {
-		status.Set(reflect.Zero(status.Type()))
-	}
-
-	return dest
-}
-
 func isBeingDeleted(obj runtime.Object) bool {
 	mObj := obj.(metav1.Object)
 	return mObj.GetDeletionTimestamp() != nil
 }
 
-func (c *Controller) GetListers() map[string]cache.GenericLister {
+func (c *Controller) GetListers() map[schema.GroupVersionResource]cache.GenericLister {
 	return c.listers
 }
 
-func (c *Controller) GetInformers() map[string]cache.SharedIndexInformer {
+func (c *Controller) GetInformers() map[schema.GroupVersionResource]cache.SharedIndexInformer {
 	return c.informers
 }
 
@@ -635,54 +590,5 @@ func (c *Controller) populateBindingPolicyResolverWithExistingBindingPolicies() 
 		c.bindingPolicyResolver.NoteBindingPolicy(bindingpolicy)
 	}
 
-	return nil
-}
-
-// sort by name and pick first cluster so that the choice is deterministic based on names
-func pickSingleCluster(clusterSet sets.Set[string]) sets.Set[string] {
-	return sets.New(sets.List(clusterSet)[0])
-}
-
-func (c *Controller) deliverObjectToManagedClusters(
-	obj runtime.Object,
-	managedClusters sets.Set[string],
-	managedByBindingPolices []string,
-	singletonStatus bool) error {
-	for clName := range managedClusters {
-		// find which bindingpolicies select this managedCluster
-		bindingPolicyNames := []string{}
-		for _, plName := range managedByBindingPolices {
-			plObj, err := c.getBindingPolicyByName(plName)
-			if err != nil {
-				return err
-			}
-			pl, err := runtimeObjectToBindingPolicy(plObj)
-			if err != nil {
-				return err
-			}
-			cl, err := ocm.GetClusterByName(c.ocmClient, clName)
-			if err != nil {
-				return err
-			}
-			// a bindingpolicy selects a managedCluster iff the managedCluster is selected by every single selector
-			// i.e. selectors are ANDed
-			matches, err := util.SelectorsMatchLabels(pl.Spec.ClusterSelectors, labels.Set(cl.Labels))
-			if err != nil {
-				return err
-			}
-			if matches {
-				bindingPolicyNames = append(bindingPolicyNames, plName)
-			}
-		}
-		if len(bindingPolicyNames) == 0 {
-			return nil
-		}
-		manifest := ocm.WrapObject(obj)
-		util.SetManagedByBindingPolicyLabels(manifest, c.wdsName, bindingPolicyNames, singletonStatus)
-		err := reconcileManifest(c.ocmClient, manifest, clName)
-		if err != nil {
-			c.logger.Error(err, "Error delivering object to mailbox")
-		}
-	}
 	return nil
 }

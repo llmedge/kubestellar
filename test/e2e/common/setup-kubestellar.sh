@@ -66,7 +66,7 @@ kflex create imbs1 --type vcluster -p ocm $disable_chatty_status
 : Install singleton status return addon in IMBS1
 :
 wait-for-cmd kubectl --context imbs1 api-resources "|" grep managedclusteraddons
-helm --kube-context imbs1 upgrade --install status-addon -n open-cluster-management oci://ghcr.io/kubestellar/ocm-status-addon-chart --version v0.2.0-rc2
+helm --kube-context imbs1 upgrade --install status-addon -n open-cluster-management oci://ghcr.io/kubestellar/ocm-status-addon-chart --version v0.2.0-rc3
 
 :
 : -------------------------------------------------------------------------
@@ -86,13 +86,37 @@ echo "wds1 created."
 
 :
 : -------------------------------------------------------------------------
+: Run OCM transport controller executable
+:
+cd "${SRC_DIR}/../../.." ## go up to KubeStellar directory
+KUBESTELLAR_DIR="$(pwd)"
+## this is a temp solution - run as executble process. this should be replaced to run as pod, ideally using helm
+OCM_TRANSPORT_PLUGIN_RELEASE="0.1.0-rc2"
+curl -sL https://github.com/kubestellar/ocm-transport-plugin/archive/refs/tags/v${OCM_TRANSPORT_PLUGIN_RELEASE}.tar.gz | tar xz
+cd ocm-transport-plugin-${OCM_TRANSPORT_PLUGIN_RELEASE}
+OCM_TRANSPORT_PLUGIN_DIR="$(pwd)"
+pwd
+echo "replace github.com/kubestellar/kubestellar => ${KUBESTELLAR_DIR}/" >> go.mod
+go mod tidy
+make build
+mv ./bin/ocm-transport-plugin ${KUBESTELLAR_DIR}/ocm-transport-plugin
+cd "${KUBESTELLAR_DIR}"
+pwd
+rm -rf ${OCM_TRANSPORT_PLUGIN_DIR}
+echo "running ocm transport plugin..."
+./ocm-transport-plugin --transport-context imbs1 --wds-context wds1 --wds-name wds1 -v=4 &> transport.log &
+
+echo "transport controller is running as background process."
+
+:
+: -------------------------------------------------------------------------
 : Create clusters and register with OCM
 :
 function create_cluster() {
   cluster=$1
   kind create cluster --name $cluster
   kubectl config rename-context kind-${cluster} $cluster
-  clusteradm --context imbs1 get token | grep '^clusteradm join' | sed "s/<cluster_name>/${cluster}/" | awk '{print $0 " --context '${cluster}' --force-internal-endpoint-lookup"}' | sh
+  clusteradm --context imbs1 get token | grep '^clusteradm join' | sed "s/<cluster_name>/${cluster}/" | awk '{print $0 " --context '${cluster}' --singleton --force-internal-endpoint-lookup"}' | sh
 }
 
 create_cluster cluster1

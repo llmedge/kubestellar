@@ -43,6 +43,7 @@ import (
 	ksclientset "github.com/kubestellar/kubestellar/pkg/generated/clientset/versioned"
 	controlv1alpha1informers "github.com/kubestellar/kubestellar/pkg/generated/informers/externalversions/control/v1alpha1"
 	controlv1alpha1listers "github.com/kubestellar/kubestellar/pkg/generated/listers/control/v1alpha1"
+	"github.com/kubestellar/kubestellar/pkg/transport/filtering"
 )
 
 const (
@@ -53,7 +54,13 @@ const (
 	originOwnerGenerationAnnotation = "transport.kubestellar.io/originOwnerReferenceBindingGeneration"
 )
 
-// NewTransportController returns a new transport controller
+// objectsFilter map from gvk to a filter function to clean specific fields from objects before adding them to a wrapped object.
+var objectsFilter = filtering.NewObjectFilteringMap()
+
+// NewTransportController returns a new transport controller.
+// This func is like NewTransportControllerForWrappedObjectGVR but first uses
+// the given transport and transportClientset to discover the GVR of wrapped objects.
+// The given transportDynamicClient is used to access the ITS.
 func NewTransportController(ctx context.Context, bindingInformer controlv1alpha1informers.BindingInformer, transport Transport,
 	wdsClientset ksclientset.Interface, wdsDynamicClient dynamic.Interface, transportClientset kubernetes.Interface,
 	transportDynamicClient dynamic.Interface, wdsName string) (*genericTransportController, error) {
@@ -62,7 +69,14 @@ func NewTransportController(ctx context.Context, bindingInformer controlv1alpha1
 	if err != nil {
 		return nil, fmt.Errorf("failed to get wrapped object GVR - %w", err)
 	}
+	return NewTransportControllerForWrappedObjectGVR(ctx, bindingInformer, transport, wdsClientset, wdsDynamicClient, transportDynamicClient, wdsName, wrappedObjectGVR), nil
+}
 
+// NewTransportControllerForWrappedObjectGVR returns a new transport controller.
+// The given transportDynamicClient is used to access the ITS.
+func NewTransportControllerForWrappedObjectGVR(ctx context.Context, bindingInformer controlv1alpha1informers.BindingInformer, transport Transport,
+	wdsClientset ksclientset.Interface, wdsDynamicClient dynamic.Interface,
+	transportDynamicClient dynamic.Interface, wdsName string, wrappedObjectGVR schema.GroupVersionResource) *genericTransportController {
 	dynamicInformerFactory := dynamicinformer.NewDynamicSharedInformerFactory(transportDynamicClient, 0)
 	wrappedObjectGenericInformer := dynamicInformerFactory.ForResource(wrappedObjectGVR)
 
@@ -98,7 +112,7 @@ func NewTransportController(ctx context.Context, bindingInformer controlv1alpha1
 	})
 	dynamicInformerFactory.Start(ctx.Done())
 
-	return transportController, nil
+	return transportController
 }
 
 func convertObjectToUnstructured(object runtime.Object) (*unstructured.Unstructured, error) {
@@ -203,7 +217,8 @@ func (c *genericTransportController) Run(ctx context.Context, workersCount int) 
 	c.logger.Info("starting workers", "count", workersCount)
 	// Launch workers to process Binding
 	for i := 1; i <= workersCount; i++ {
-		go wait.UntilWithContext(ctx, func(ctx context.Context) { c.runWorker(ctx, i) }, time.Second)
+		workerId := i // in go, there is one `i` variable that gets different values in different iterations of the loop
+		go wait.UntilWithContext(ctx, func(ctx context.Context) { c.runWorker(ctx, workerId) }, time.Second)
 	}
 
 	c.logger.Info("started workers")
@@ -374,36 +389,22 @@ func (c *genericTransportController) getObjectsFromWDS(ctx context.Context, bind
 	objectsToPropagate := make([]*unstructured.Unstructured, 0)
 	// add cluster-scoped objects to the 'objectsToPropagate' slice
 	for _, clusterScopedObject := range binding.Spec.Workload.ClusterScope {
-		if clusterScopedObject.ObjectNames == nil {
-			continue // no objects from this gvr, skip
+		gvr := schema.GroupVersionResource(clusterScopedObject.GroupVersionResource)
+		object, err := c.wdsDynamicClient.Resource(gvr).Get(ctx, clusterScopedObject.Name, metav1.GetOptions{})
+		if err != nil {
+			return nil, fmt.Errorf("failed to get required cluster-scoped object '%s' with gvr %s from WDS - %w", clusterScopedObject.Name, gvr, err)
 		}
-		gvr := schema.GroupVersionResource{Group: clusterScopedObject.Group, Version: clusterScopedObject.Version, Resource: clusterScopedObject.Resource}
-		gvrDynamicClient := c.wdsDynamicClient.Resource(gvr)
-		for _, objectName := range clusterScopedObject.ObjectNames {
-			object, err := gvrDynamicClient.Get(ctx, objectName, metav1.GetOptions{})
-			if err != nil {
-				return nil, fmt.Errorf("failed to get required cluster-scoped object '%s' with gvr %s from WDS - %w", objectName, gvr, err)
-			}
-			objectsToPropagate = append(objectsToPropagate, cleanObject(object))
-		}
+		objectsToPropagate = append(objectsToPropagate, cleanObject(object))
 	}
 	// add namespace-scoped objects to the 'objectsToPropagate' slice
 	for _, namespaceScopedObject := range binding.Spec.Workload.NamespaceScope {
-		gvr := schema.GroupVersionResource{Group: namespaceScopedObject.Group, Version: namespaceScopedObject.Version, Resource: namespaceScopedObject.Resource}
-		gvrDynamicClient := c.wdsDynamicClient.Resource(gvr)
-		for _, objectsByNamespace := range namespaceScopedObject.ObjectsByNamespace {
-			if objectsByNamespace.Names == nil {
-				continue // no objects from this namespace, skip
-			}
-			for _, objectName := range objectsByNamespace.Names {
-				object, err := gvrDynamicClient.Namespace(objectsByNamespace.Namespace).Get(ctx, objectName, metav1.GetOptions{})
-				if err != nil {
-					return nil, fmt.Errorf("failed to get required namespace-scoped object '%s' in namespace '%s' with gvr '%s' from WDS - %w", objectName,
-						objectsByNamespace.Namespace, gvr, err)
-				}
-				objectsToPropagate = append(objectsToPropagate, cleanObject(object))
-			}
+		gvr := schema.GroupVersionResource(namespaceScopedObject.GroupVersionResource)
+		object, err := c.wdsDynamicClient.Resource(gvr).Namespace(namespaceScopedObject.Namespace).Get(ctx, namespaceScopedObject.Name, metav1.GetOptions{})
+		if err != nil {
+			return nil, fmt.Errorf("failed to get required namespace-scoped object '%s' in namespace '%s' with gvr '%s' from WDS - %w", namespaceScopedObject.Name,
+				namespaceScopedObject.Namespace, gvr, err)
 		}
+		objectsToPropagate = append(objectsToPropagate, cleanObject(object))
 	}
 
 	return objectsToPropagate, nil
@@ -608,6 +609,8 @@ func cleanObject(object *unstructured.Unstructured) *unstructured.Unstructured {
 	delete(annotations, "kubectl.kubernetes.io/last-applied-configuration")
 	objectCopy.SetAnnotations(annotations)
 
-	return objectCopy
+	// clean fields specific to the concrete object.
+	objectsFilter.CleanObjectSpecifics(objectCopy)
 
+	return objectCopy
 }

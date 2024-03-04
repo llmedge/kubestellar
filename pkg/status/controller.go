@@ -40,7 +40,6 @@ import (
 	"k8s.io/klog/v2"
 	"sigs.k8s.io/controller-runtime/pkg/log"
 	"sigs.k8s.io/controller-runtime/pkg/log/zap"
-	ctrlm "sigs.k8s.io/controller-runtime/pkg/manager"
 
 	"github.com/kubestellar/kubestellar/api/control/v1alpha1"
 	"github.com/kubestellar/kubestellar/pkg/util"
@@ -65,14 +64,14 @@ type Controller struct {
 	workqueue             workqueue.RateLimitingInterface
 	// all wds listers/informers are required to retrieve objects and update status
 	// without having to re-create new caches for this coontroller
-	listers   map[string]cache.GenericLister
-	informers map[string]cache.SharedIndexInformer
+	listers   map[schema.GroupVersionResource]cache.GenericLister
+	informers map[schema.GroupVersionResource]cache.SharedIndexInformer
 }
 
 // Create a new  status controller
-func NewController(mgr ctrlm.Manager, wdsRestConfig *rest.Config, imbsRestConfig *rest.Config,
-	wdsName string, listers map[string]cache.GenericLister,
-	informers map[string]cache.SharedIndexInformer) (*Controller, error) {
+func NewController(wdsRestConfig *rest.Config, imbsRestConfig *rest.Config,
+	wdsName string, listers map[schema.GroupVersionResource]cache.GenericLister,
+	informers map[schema.GroupVersionResource]cache.SharedIndexInformer) (*Controller, error) {
 	ratelimiter := workqueue.NewMaxOfRateLimiter(
 		workqueue.NewItemExponentialFailureRateLimiter(5*time.Millisecond, 1000*time.Second),
 		&workqueue.BucketRateLimiter{Limiter: rate.NewLimiter(rate.Limit(50), 300)},
@@ -331,7 +330,7 @@ func (c *Controller) reconcile(ctx context.Context, ref cache.ObjectName) error 
 	}
 
 	// only process workstatues with the label for single reported status
-	if _, ok := obj.(metav1.Object).GetLabels()[util.BindingPolicyLabelSingletonStatus]; !ok {
+	if _, ok := obj.(metav1.Object).GetLabels()[util.BindingPolicyLabelSingletonStatusKey]; !ok {
 		return nil
 	}
 
@@ -351,13 +350,12 @@ func (c *Controller) reconcile(ctx context.Context, ref cache.ObjectName) error 
 }
 
 func updateObjectStatus(ctx context.Context, objRef *util.SourceRef, status map[string]interface{},
-	listers map[string]cache.GenericLister, wdsDynClient dynamic.Interface) error {
+	listers map[schema.GroupVersionResource]cache.GenericLister, wdsDynClient dynamic.Interface) error {
 
-	key := util.KeyForGroupVersionKind(objRef.Group, objRef.Version, objRef.Kind)
-
-	lister, ok := listers[key]
+	gvr := schema.GroupVersionResource{Group: objRef.Group, Version: objRef.Version, Resource: objRef.Resource}
+	lister, ok := listers[gvr]
 	if !ok {
-		return fmt.Errorf("could not find lister for GVK key %s", key)
+		return fmt.Errorf("could not find lister for gvr %s", gvr)
 	}
 
 	obj, err := getObject(lister, objRef.Namespace, objRef.Name)
@@ -373,7 +371,6 @@ func updateObjectStatus(ctx context.Context, objRef *util.SourceRef, status map[
 	// set the status and update the object
 	unstrObj.Object["status"] = status
 
-	gvr := schema.GroupVersionResource{Group: objRef.Group, Version: objRef.Version, Resource: objRef.Resource}
 	if objRef.Namespace == "" {
 		_, err = wdsDynClient.Resource(gvr).UpdateStatus(ctx, unstrObj, metav1.UpdateOptions{})
 	} else {
